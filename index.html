@@ -1345,6 +1345,11 @@
       return hasDeliveryCardLabel(row?.[columnMap.contactName] || row?.ContactName || row?.customer_name || '');
     }
 
+    function isCollectionOrDeliveryClientName(value) {
+      const name = String(value || '').trim();
+      return /collection|delivery/i.test(name);
+    }
+
     function preferInvoiceSourceRow(candidate, current) {
       const candidateIsDelivery = isDeliveryLegRow(candidate);
       const currentIsDelivery = isDeliveryLegRow(current);
@@ -1415,7 +1420,7 @@
       const key = normaliseCustomerName(customerName);
       if (!key) return null;
 
-      const activeClients = state.clients.filter(client => !client.ignore);
+      const activeClients = state.clients.filter(client => !client.ignore && !isCollectionOrDeliveryClientName(client.customer_name));
       const exact = activeClients.find(client => normaliseCustomerName(client.customer_name) === key);
       if (exact) return exact;
 
@@ -2976,6 +2981,7 @@
       const term = String($('clientSearch')?.value || '').toLowerCase().trim();
       const clients = state.clients.filter(client => {
         if (client.ignore) return false;
+        if (isCollectionOrDeliveryClientName(client.customer_name)) return false;
         const haystack = `${client.customer_name || ''} ${client.accounts_email || ''} ${client.traffic_email || ''} ${client.accounts_tel || ''} ${client.booking_address || ''}`.toLowerCase();
         return !term || haystack.includes(term);
       });
@@ -3161,9 +3167,13 @@
       state.clientsFetchError = '';
       state.clients = allClients.map(client => ({ ...client, ignore: !!client.ignore }));
       renderClients();
-      const visibleCount = state.clients.filter(client => !client.ignore).length;
-      const ignoredCount = state.clients.length - visibleCount;
-      if (showStatus) showMessage($('clientMessage'), `Loaded ${visibleCount} active client(s). ${ignoredCount ? `${ignoredCount} ignored client(s) are hidden.` : ''}`, 'success');
+      const visibleCount = state.clients.filter(client => !client.ignore && !isCollectionOrDeliveryClientName(client.customer_name)).length;
+      const hiddenLabelCount = state.clients.filter(client => !client.ignore && isCollectionOrDeliveryClientName(client.customer_name)).length;
+      const ignoredCount = state.clients.filter(client => client.ignore).length;
+      const hiddenNote = ignoredCount || hiddenLabelCount
+        ? ` ${ignoredCount + hiddenLabelCount} hidden client(s) are not shown${hiddenLabelCount ? `, including ${hiddenLabelCount} collection/delivery-labelled account(s)` : ''}.`
+        : '';
+      if (showStatus) showMessage($('clientMessage'), `Loaded ${visibleCount} active client(s).${hiddenNote}`, 'success');
       return true;
     }
 
@@ -3265,9 +3275,21 @@
       let renamed = 0;
       let removed = 0;
       let merged = 0;
+      let hidden = 0;
       const groups = new Map();
 
-      state.clients.filter(client => !client.ignore).forEach(client => {
+      for (const client of state.clients.filter(client => !client.ignore && isCollectionOrDeliveryClientName(client.customer_name))) {
+        const { error } = await state.supabase
+          .from('customer_invoice_emails')
+          .update({ ignore: true })
+          .eq('id', client.id);
+        if (!error) {
+          client.ignore = true;
+          hidden += 1;
+        }
+      }
+
+      state.clients.filter(client => !client.ignore && !isCollectionOrDeliveryClientName(client.customer_name)).forEach(client => {
         const rawName = String(client.customer_name || '').trim().replace(/\s+/g, ' ');
         const cleanName = cleanPlannerCustomerName(rawName);
         const key = normaliseCustomerName(cleanName);
@@ -3332,8 +3354,8 @@
         }
       }
 
-      if (renamed || removed || merged) await fetchClients(false);
-      return { renamed, removed, merged };
+      if (renamed || removed || merged || hidden) await fetchClients(false);
+      return { renamed, removed, merged, hidden };
     }
 
     async function syncClientsFromPlanner(showStatus = true) {
@@ -3368,7 +3390,9 @@
 
         (data || []).forEach(row => {
           const rawName = String(row.customer_name || '').trim().replace(/\s+/g, ' ');
+          if (isCollectionOrDeliveryClientName(rawName)) return;
           const cleanName = cleanPlannerCustomerName(rawName);
+          if (isCollectionOrDeliveryClientName(cleanName)) return;
           const key = normaliseCustomerName(cleanName);
           if (!rawName || !cleanName || !key) return;
           if (isPlannedMaintenanceCustomer(rawName)) return;
@@ -3397,7 +3421,7 @@
           renderInvoiceList();
         }
         if (showStatus) {
-          const cleanupNote = cleanup.renamed || cleanup.removed ? ` Cleaned ${cleanup.renamed} Leg/delivery-labelled profile(s), merged ${cleanup.merged || 0} contact detail(s), and removed ${cleanup.removed} duplicate profile(s).` : '';
+          const cleanupNote = cleanup.renamed || cleanup.removed || cleanup.hidden ? ` Cleaned ${cleanup.renamed} Leg/delivery-labelled profile(s), merged ${cleanup.merged || 0} contact detail(s), removed ${cleanup.removed} duplicate profile(s), and hid ${cleanup.hidden || 0} collection/delivery account(s).` : '';
           const labelNote = cleanedPlannerLabels ? ` ${cleanedPlannerLabels} planner row(s) had Leg/delivery labels normalised.` : '';
           showMessage($('clientMessage'), `Client sync complete. No new booking customers were found.${cleanupNote}${labelNote}`, 'success');
         }
@@ -3424,7 +3448,7 @@
         renderInvoiceList();
       }
       if (showStatus) {
-        const cleanupNote = cleanup.renamed || cleanup.removed ? ` Cleaned ${cleanup.renamed} Leg/delivery-labelled profile(s), merged ${cleanup.merged || 0} contact detail(s), and removed ${cleanup.removed} duplicate profile(s).` : '';
+        const cleanupNote = cleanup.renamed || cleanup.removed || cleanup.hidden ? ` Cleaned ${cleanup.renamed} Leg/delivery-labelled profile(s), merged ${cleanup.merged || 0} contact detail(s), removed ${cleanup.removed} duplicate profile(s), and hid ${cleanup.hidden || 0} collection/delivery account(s).` : '';
         const labelNote = cleanedPlannerLabels ? ` ${cleanedPlannerLabels} planner row(s) had Leg/delivery labels normalised.` : '';
         showMessage($('clientMessage'), `Client sync complete. Added ${newClients.length} new booking customer profile(s) from quotes.customer_name.${cleanupNote}${labelNote}`, 'success');
       }
@@ -3445,6 +3469,10 @@
 
       if (!customer_name) {
         showMessage($('clientMessage'), 'Please enter the customer name.', 'error');
+        return;
+      }
+      if (isCollectionOrDeliveryClientName(customer_name)) {
+        showMessage($('clientMessage'), 'This looks like a collection/delivery planner label, so it has not been saved as a client account.', 'error');
         return;
       }
       if (accounts_email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(accounts_email)) {
