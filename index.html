@@ -441,12 +441,6 @@
       align-items: flex-start;
     }
 
-    .traffic-email-line {
-      font-size: 12px;
-      color: var(--muted);
-      line-height: 1.3;
-    }
-
     .client-actions {
       display: flex;
       gap: 8px;
@@ -873,17 +867,25 @@
           </div>
 
           <div class="card span-6">
-            <h3>Office login</h3>
-            <p class="muted small">This uses Supabase Auth email/password. You can add staff users from the Supabase dashboard.</p>
-            <label for="loginEmail">Email</label>
-            <input id="loginEmail" type="email" autocomplete="email" />
+            <h3>Create office user</h3>
+            <p class="muted small">Creates a Supabase Auth login and adds the staff member to the office_users access table. Only office_users with the admin role can do this.</p>
+            <label for="officeUserEmail">Staff email</label>
+            <input id="officeUserEmail" type="email" autocomplete="off" placeholder="staff@frosttransportsolutions.co.uk" />
             <div style="height: 12px;"></div>
-            <label for="loginPassword">Password</label>
-            <input id="loginPassword" type="password" autocomplete="current-password" />
+            <label for="officeUserPassword">Temporary password</label>
+            <input id="officeUserPassword" type="text" autocomplete="off" placeholder="Temporary password" />
+            <div style="height: 12px;"></div>
+            <label for="officeUserRole">Role</label>
+            <select id="officeUserRole">
+              <option value="office">Office</option>
+              <option value="accounts">Accounts</option>
+              <option value="admin">Admin</option>
+            </select>
             <div class="btn-row" style="margin-top: 12px;">
-              <button class="primary" id="loginBtn">Login</button>
+              <button class="secondary" id="generateOfficePasswordBtn" type="button">Generate password</button>
+              <button class="primary" id="createOfficeUserBtn" type="button">Create office user</button>
             </div>
-            <div id="loginMessage"></div>
+            <div id="officeUserMessage"></div>
           </div>
         </div>
       </section>
@@ -1233,6 +1235,41 @@
       showMessage($('gateLoginMessage'), text, type);
     }
 
+    function isMissingOfficeUsersTableError(error) {
+      const message = String(error?.message || '').toLowerCase();
+      return error?.code === '42P01'
+        || message.includes('office_users')
+        || message.includes('relation')
+        || message.includes('does not exist');
+    }
+
+    async function checkOfficeUserAccess(user) {
+      const email = String(user?.email || '').trim().toLowerCase();
+      if (!email) {
+        return { allowed: false, message: 'This login does not have an email address, so it cannot access the invoice manager.' };
+      }
+
+      const { data, error } = await state.supabase
+        .from('office_users')
+        .select('email, role, active')
+        .eq('email', email)
+        .eq('active', true)
+        .maybeSingle();
+
+      if (error) {
+        if (isMissingOfficeUsersTableError(error)) {
+          return { allowed: false, message: 'Office user security is not set up yet. Please run the add-office-users.sql file in Supabase first.' };
+        }
+        return { allowed: false, message: error.message || 'Could not check whether this login is authorised for the invoice manager.' };
+      }
+
+      if (!data) {
+        return { allowed: false, message: 'This account is not authorised for the Frost invoice manager.' };
+      }
+
+      return { allowed: true, role: data.role || 'office' };
+    }
+
     async function refreshAuthGate() {
       if (!state.supabase) {
         $('loginScreen').classList.remove('hidden');
@@ -1243,15 +1280,27 @@
 
       const { data } = await state.supabase.auth.getSession();
       const user = data?.session?.user || null;
-      const isLoggedIn = !!user;
-      $('loginScreen').classList.toggle('hidden', isLoggedIn);
-      $('appShell').classList.toggle('hidden', !isLoggedIn);
-      if (isLoggedIn) {
-        setConnected(true, `Logged in: ${user.email || 'office user'}`);
-      } else {
+      if (!user) {
+        $('loginScreen').classList.remove('hidden');
+        $('appShell').classList.add('hidden');
         setConnected(false, 'Login required');
+        return false;
       }
-      return isLoggedIn;
+
+      const access = await checkOfficeUserAccess(user);
+      if (!access.allowed) {
+        await state.supabase.auth.signOut({ scope: 'local' });
+        $('loginScreen').classList.remove('hidden');
+        $('appShell').classList.add('hidden');
+        setConnected(false, 'Login required');
+        setLoginScreenMessage(access.message, 'error');
+        return false;
+      }
+
+      $('loginScreen').classList.add('hidden');
+      $('appShell').classList.remove('hidden');
+      setConnected(true, `Logged in: ${user.email || 'office user'}${access.role ? ` (${access.role})` : ''}`);
+      return true;
     }
 
     async function gateLogin() {
@@ -2069,6 +2118,28 @@
       return Number.isInteger(n) ? String(n) : n.toFixed(2).replace(/0+$/, '').replace(/\.$/, '');
     }
 
+    function moneyRateValue(value, fallback = 0) {
+      const n = Number(String(value ?? '').replace(/[^0-9.-]/g, ''));
+      if (!Number.isFinite(n) || n < 0) return fallback;
+      return Math.min(n, 10000);
+    }
+
+    function moneyRateDisplay(value) {
+      const n = moneyRateValue(value, 0);
+      return Number.isInteger(n) ? String(n) : n.toFixed(2).replace(/0+$/, '').replace(/\.$/, '');
+    }
+
+    function hourAllowanceValue(value, fallback = 1) {
+      const n = Number(String(value ?? '').replace(/[^0-9.-]/g, ''));
+      if (!Number.isFinite(n) || n < 0) return fallback;
+      return Math.min(n, 1000);
+    }
+
+    function hourAllowanceDisplay(value) {
+      const n = hourAllowanceValue(value, 1);
+      return Number.isInteger(n) ? String(n) : n.toFixed(2).replace(/0+$/, '').replace(/\.$/, '');
+    }
+
     function isValidEmailAddress(value) {
       return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(value || '').trim());
     }
@@ -2084,6 +2155,18 @@
     function isMissingMarkupColumnError(error) {
       const text = String(error?.message || error || '').toLowerCase();
       return text.includes('quote_markup_percent') && (text.includes('column') || text.includes('schema cache') || text.includes('could not find'));
+    }
+
+    function isMissingDemurrageColumnError(error) {
+      const text = String(error?.message || error || '').toLowerCase();
+      return text.includes('demurrage_rate_per_hour') && (text.includes('column') || text.includes('schema cache') || text.includes('could not find'));
+    }
+
+    function isMissingPortalPricingColumnError(error) {
+      const text = String(error?.message || error || '').toLowerCase();
+      return ['quote_markup_percent', 'demurrage_rate_per_hour', 'loading_time_allowance_hours', 'tipping_time_allowance_hours']
+        .some(column => text.includes(column))
+        && (text.includes('column') || text.includes('schema cache') || text.includes('could not find'));
     }
 
     function isMissingTrafficEmailColumnError(error) {
@@ -3010,7 +3093,7 @@
           <td>
             <div class="client-email-stack">
               ${client.accounts_email ? `<span class="tag">${escapeHtml(client.accounts_email)}</span>` : '<span class="muted">No accounts email</span>'}
-              ${client.traffic_email ? `<span class="traffic-email-line">Traffic: ${escapeHtml(client.traffic_email)}</span>` : ''}
+              ${client.traffic_email ? `<span class="tag">${escapeHtml(client.traffic_email)}</span>` : ''}
             </div>
           </td>
           <td>${escapeHtml(client.accounts_tel || '')}</td>
@@ -3068,13 +3151,28 @@
           ${profileDetail('Accounts telephone', client.accounts_tel)}
           ${profileDetail('Booking customer account', portalActive ? 'Active' : 'Not active')}
           ${profileDetail('Booking customer address', client.booking_address)}
-          <div class="profile-detail">
-            <span>Mark up %</span>
-            <div style="display:flex; gap:8px; align-items:center;">
-              <input id="clientProfileMarkupPercent" type="number" min="0" max="1000" step="0.01" value="${escapeHtml(markupPercentDisplay(client.quote_markup_percent))}" style="max-width:120px;" />
-              <button class="primary" id="saveClientProfileMarkupBtn" type="button">Save mark up</button>
+          ${portalActive ? `<div class="profile-detail">
+            <span>Portal pricing settings</span>
+            <div style="display:flex; flex-wrap:wrap; gap:10px; align-items:end;">
+              <label style="margin:0; max-width:130px;">
+                Mark up %
+                <input id="clientProfileMarkupPercent" type="number" min="0" max="1000" step="0.01" value="${escapeHtml(markupPercentDisplay(client.quote_markup_percent))}" />
+              </label>
+              <label style="margin:0; max-width:160px;">
+                Demurrage rate £P/H
+                <input id="clientProfileDemurrageRate" type="number" min="0" max="10000" step="0.01" value="${escapeHtml(moneyRateDisplay(client.demurrage_rate_per_hour))}" />
+              </label>
+              <label style="margin:0; max-width:210px;">
+                Loading time allowance before demurrage
+                <input id="clientProfileLoadingAllowance" type="number" min="0" max="1000" step="0.25" value="${escapeHtml(hourAllowanceDisplay(client.loading_time_allowance_hours))}" />
+              </label>
+              <label style="margin:0; max-width:210px;">
+                Tipping time allowance before demurrage
+                <input id="clientProfileTippingAllowance" type="number" min="0" max="1000" step="0.25" value="${escapeHtml(hourAllowanceDisplay(client.tipping_time_allowance_hours))}" />
+              </label>
+              <button class="primary" id="saveClientProfilePricingBtn" type="button">Save settings</button>
             </div>
-          </div>
+          </div>` : profileDetail('Portal pricing settings', 'Create booking account first')}
           ${profileDetail('Temporary password', passwordText)}
           ${profileDetail('Portal created', client.portal_created_at ? ukDate(client.portal_created_at) : '')}
           ${profileDetail('Client record created', client.created_at ? ukDate(client.created_at) : '')}
@@ -3083,7 +3181,7 @@
         <p class="muted small" style="margin: 14px 0 0;">
           This shows the temporary password created by the invoice app. Existing booking accounts created before this change will only show a password after you issue/save a new temporary one.
         </p>`;
-      $('saveClientProfileMarkupBtn')?.addEventListener('click', () => saveClientProfileMarkup(client.id));
+      $('saveClientProfilePricingBtn')?.addEventListener('click', () => saveClientProfilePricingSettings(client.id));
       $('saveClientProfileTrafficEmailBtn')?.addEventListener('click', () => saveClientProfileTrafficEmail(client.id));
       $('clientProfileModal').classList.remove('hidden');
     }
@@ -3092,23 +3190,52 @@
       $('clientProfileModal').classList.add('hidden');
     }
 
-    async function saveClientProfileMarkup(clientId) {
+    async function saveClientProfilePricingSettings(clientId) {
       if (!state.supabase) {
         showMessage($('clientMessage'), 'Connect to Supabase first.', 'error');
         return;
       }
       const client = state.clients.find(c => c.id === clientId);
       if (!client) return;
+      if (!client.auth_user_id && !client.portal_enabled) {
+        showMessage($('clientMessage'), 'Create a booking customer account before saving portal pricing settings.', 'error');
+        return;
+      }
+
       const markup = markupPercentValue($('clientProfileMarkupPercent')?.value, 20);
+      const demurrageRate = moneyRateValue($('clientProfileDemurrageRate')?.value, 0);
+      const loadingAllowance = hourAllowanceValue($('clientProfileLoadingAllowance')?.value, 1);
+      const tippingAllowance = hourAllowanceValue($('clientProfileTippingAllowance')?.value, 1);
+      const portalEmail = String(client._portalAccount?.email || client.accounts_email || '').trim().toLowerCase();
+
+      if (!client.auth_user_id) {
+        showMessage($('clientMessage'), 'This client is marked as portal enabled, but no Supabase Auth user id is linked yet.', 'error');
+        return;
+      }
+      if (!portalEmail || !isValidEmailAddress(portalEmail)) {
+        showMessage($('clientMessage'), 'This booking account needs a valid login email before portal pricing settings can be saved.', 'error');
+        return;
+      }
 
       const { error } = await state.supabase
-        .from('customer_invoice_emails')
-        .update({ quote_markup_percent: markup })
-        .eq('id', clientId);
+        .from('customer_portal_accounts')
+        .upsert({
+          client_id: String(client.id),
+          auth_user_id: client.auth_user_id,
+          customer_name: client.customer_name || portalEmail,
+          email: portalEmail,
+          accounts_tel: client.accounts_tel || null,
+          booking_address: client.booking_address || null,
+          portal_enabled: true,
+          quote_markup_percent: markup,
+          demurrage_rate_per_hour: demurrageRate,
+          loading_time_allowance_hours: loadingAllowance,
+          tipping_time_allowance_hours: tippingAllowance
+        }, { onConflict: 'client_id' });
 
       if (error) {
-        if (isMissingMarkupColumnError(error)) {
-          showMessage($('clientMessage'), 'Mark up was not saved because the quote_markup_percent column has not been added to Supabase yet.', 'error');
+        if (isMissingPortalPricingColumnError(error)) {
+          showMessage($('clientMessage'), 'Portal pricing settings were not saved because the customer_portal_accounts pricing columns have not been added to Supabase yet.', 'error');
         } else {
           showMessage($('clientMessage'), error.message, 'error');
         }
@@ -3116,9 +3243,12 @@
       }
 
       client.quote_markup_percent = markup;
+      client.demurrage_rate_per_hour = demurrageRate;
+      client.loading_time_allowance_hours = loadingAllowance;
+      client.tipping_time_allowance_hours = tippingAllowance;
       await fetchClients(false);
       openClientProfileModal(clientId);
-      showMessage($('clientMessage'), `Mark up saved at ${markupPercentDisplay(markup)}%.`, 'success');
+      showMessage($('clientMessage'), `Pricing settings saved. Mark up ${markupPercentDisplay(markup)}%, demurrage £${moneyRateDisplay(demurrageRate)} P/H, loading allowance ${hourAllowanceDisplay(loadingAllowance)} hour(s), tipping allowance ${hourAllowanceDisplay(tippingAllowance)} hour(s).`, 'success');
     }
 
     async function saveClientProfileTrafficEmail(clientId) {
@@ -3154,6 +3284,36 @@
       showMessage($('clientMessage'), 'Traffic Email saved successfully.', 'success');
     }
 
+    async function fetchPortalAccountsForClients(clients) {
+      const clientIds = (clients || [])
+        .map(client => String(client.id || '').trim())
+        .filter(Boolean);
+      const portalByClientId = new Map();
+      if (!state.supabase || !clientIds.length) return portalByClientId;
+
+      for (let i = 0; i < clientIds.length; i += 500) {
+        const batch = clientIds.slice(i, i + 500);
+        const { data, error } = await state.supabase
+          .from('customer_portal_accounts')
+          .select('client_id, auth_user_id, email, portal_enabled, quote_markup_percent, demurrage_rate_per_hour, loading_time_allowance_hours, tipping_time_allowance_hours')
+          .in('client_id', batch);
+
+        if (error) {
+          // If the portal pricing SQL has not been run yet, keep the rest of the
+          // Clients section working and show old client-table values as fallback.
+          console.warn('Portal account settings could not be loaded:', error.message || error);
+          return portalByClientId;
+        }
+
+        (data || []).forEach(portal => {
+          const key = String(portal.client_id || '').trim();
+          if (key) portalByClientId.set(key, portal);
+        });
+      }
+
+      return portalByClientId;
+    }
+
     async function fetchClients(showStatus = true) {
       if (!state.supabase) {
         state.clientsFetchError = 'Not connected to Supabase.';
@@ -3183,7 +3343,21 @@
       }
 
       state.clientsFetchError = '';
-      state.clients = allClients.map(client => ({ ...client, ignore: !!client.ignore }));
+      const portalByClientId = await fetchPortalAccountsForClients(allClients);
+      state.clients = allClients.map(client => {
+        const portal = portalByClientId.get(String(client.id || '').trim()) || null;
+        return {
+          ...client,
+          ignore: !!client.ignore,
+          _portalAccount: portal,
+          auth_user_id: portal?.auth_user_id || client.auth_user_id,
+          portal_enabled: portal?.portal_enabled ?? client.portal_enabled,
+          quote_markup_percent: portal?.quote_markup_percent ?? client.quote_markup_percent,
+          demurrage_rate_per_hour: portal?.demurrage_rate_per_hour ?? client.demurrage_rate_per_hour,
+          loading_time_allowance_hours: portal?.loading_time_allowance_hours ?? 1,
+          tipping_time_allowance_hours: portal?.tipping_time_allowance_hours ?? 1
+        };
+      });
       renderClients();
       const visibleCount = state.clients.filter(client => !client.ignore && !isCollectionOrDeliveryClientName(client.customer_name)).length;
       const hiddenLabelCount = state.clients.filter(client => !client.ignore && isCollectionOrDeliveryClientName(client.customer_name)).length;
@@ -3283,6 +3457,62 @@
       }
     }
 
+    async function createOfficeUser() {
+      if (!state.supabase) {
+        showMessage($('officeUserMessage'), 'Connect to Supabase first.', 'error');
+        return;
+      }
+
+      const email = String($('officeUserEmail')?.value || '').trim().toLowerCase();
+      const password = String($('officeUserPassword')?.value || '').trim();
+      const role = String($('officeUserRole')?.value || 'office').trim() || 'office';
+
+      if (!email || !isValidEmailAddress(email)) {
+        showMessage($('officeUserMessage'), 'Enter a valid staff email address.', 'error');
+        return;
+      }
+      if (password.length < 8) {
+        showMessage($('officeUserMessage'), 'Temporary password must be at least 8 characters.', 'error');
+        return;
+      }
+
+      const submitBtn = $('createOfficeUserBtn');
+      submitBtn.disabled = true;
+      showMessage($('officeUserMessage'), 'Creating office user...');
+
+      try {
+        const supabaseUrl = (localStorage.getItem('invoice_app_supabase_url') || DEFAULT_SUPABASE_URL).replace(/\/$/, '');
+        const anonKey = localStorage.getItem('invoice_app_supabase_anon_key') || DEFAULT_SUPABASE_ANON_KEY;
+        const { data: sessionData } = await state.supabase.auth.getSession();
+        const bearer = sessionData?.session?.access_token || '';
+        if (!bearer) throw new Error('Please login with your office account first.');
+
+        const response = await fetch(`${supabaseUrl}/functions/v1/create-office-user`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'apikey': anonKey,
+            'Authorization': `Bearer ${bearer}`
+          },
+          body: JSON.stringify({ email, password, role })
+        });
+
+        const text = await response.text();
+        let data;
+        try { data = text ? JSON.parse(text) : {}; } catch { data = { error: text }; }
+        if (!response.ok) throw new Error(data?.error || data?.message || text || `HTTP ${response.status}`);
+
+        $('officeUserEmail').value = '';
+        $('officeUserPassword').value = generateTemporaryPassword();
+        $('officeUserRole').value = 'office';
+        showMessage($('officeUserMessage'), `Office user created for ${email}. Give them the temporary password securely.`, 'success');
+      } catch (error) {
+        showMessage($('officeUserMessage'), error.message || 'Could not create the office user.', 'error');
+      } finally {
+        submitBtn.disabled = false;
+      }
+    }
+
     function hasClientContactDetails(client) {
       return !!((client.accounts_email || '').trim() || (client.traffic_email || '').trim() || (client.accounts_tel || '').trim() || (client.booking_address || '').trim());
     }
@@ -3355,6 +3585,10 @@
           if (!((primary.booking_address || '').trim()) && (duplicate.booking_address || '').trim()) {
             payload.booking_address = duplicate.booking_address;
             primary.booking_address = duplicate.booking_address;
+          }
+          if (moneyRateValue(primary.demurrage_rate_per_hour, 0) <= 0 && moneyRateValue(duplicate.demurrage_rate_per_hour, 0) > 0) {
+            payload.demurrage_rate_per_hour = moneyRateValue(duplicate.demurrage_rate_per_hour, 0);
+            primary.demurrage_rate_per_hour = payload.demurrage_rate_per_hour;
           }
 
           if (Object.keys(payload).length) {
@@ -3665,7 +3899,8 @@
         showMessage($('settingsMessage'), 'Settings saved on this device.', 'success');
       });
       $('testConnectionBtn').addEventListener('click', testConnection);
-      $('loginBtn').addEventListener('click', login);
+      $('generateOfficePasswordBtn').addEventListener('click', () => { $('officeUserPassword').value = generateTemporaryPassword(); });
+      $('createOfficeUserBtn').addEventListener('click', createOfficeUser);
       $('signOutBtn').addEventListener('click', signOut);
       $('loadRowsBtn').addEventListener('click', loadRows);
       $('clearRowsBtn').addEventListener('click', () => { state.rows = []; renderRowsPreview(); showMessage($('exportMessage'), 'Rows cleared.'); });
@@ -3743,6 +3978,7 @@
     initDates();
     wireNav();
     wireEvents();
+    if ($('officeUserPassword')) $('officeUserPassword').value = generateTemporaryPassword();
     initSupabase();
   </script>
 </body>
