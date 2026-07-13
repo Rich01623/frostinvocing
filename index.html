@@ -3223,6 +3223,21 @@
           ${profileDetail('Booking customer account', portalActive ? 'Active' : 'Not active')}
           ${profileDetail('Booking customer address', client.booking_address)}
           ${portalActive ? `<div class="profile-detail">
+            <span>Booking account controls</span>
+            <div style="display:flex; flex-wrap:wrap; gap:8px; align-items:center;">
+              <button class="danger" id="disableBookingAccountBtn" type="button">Disable customer booking account</button>
+              <span class="muted small">Deletes the portal login but keeps this client profile.</span>
+            </div>
+          </div>` : ''}
+          ${portalActive ? `<div class="profile-detail">
+            <span>Temporary password</span>
+            <div style="display:flex; flex-wrap:wrap; gap:8px; align-items:center;">
+              <input id="clientProfilePortalPassword" type="text" value="${escapeHtml(tempPassword)}" placeholder="Enter a new temporary password" style="max-width:260px;" />
+              <button class="secondary" id="generateClientPortalPasswordBtn" type="button">Generate</button>
+              <button class="primary" id="saveClientPortalPasswordBtn" type="button">Save password</button>
+            </div>
+          </div>` : profileDetail('Temporary password', passwordText)}
+          ${portalActive ? `<div class="profile-detail">
             <span>Portal pricing settings</span>
             <div style="display:flex; flex-wrap:wrap; gap:10px; align-items:end;">
               <label style="margin:0; max-width:130px;">
@@ -3244,7 +3259,6 @@
               <button class="primary" id="saveClientProfilePricingBtn" type="button">Save settings</button>
             </div>
           </div>` : profileDetail('Portal pricing settings', 'Create booking account first')}
-          ${profileDetail('Temporary password', passwordText)}
           ${profileDetail('Portal created', client.portal_created_at ? ukDate(client.portal_created_at) : '')}
           ${profileDetail('Client record created', client.created_at ? ukDate(client.created_at) : '')}
           ${profileDetail('Client record updated', client.updated_at ? ukDate(client.updated_at) : '')}
@@ -3254,6 +3268,9 @@
         </p>`;
       $('saveClientProfilePricingBtn')?.addEventListener('click', () => saveClientProfilePricingSettings(client.id));
       $('saveClientProfileTrafficEmailBtn')?.addEventListener('click', () => saveClientProfileTrafficEmail(client.id));
+      $('generateClientPortalPasswordBtn')?.addEventListener('click', () => { $('clientProfilePortalPassword').value = generateTemporaryPassword(); });
+      $('saveClientPortalPasswordBtn')?.addEventListener('click', () => saveClientPortalPassword(client.id));
+      $('disableBookingAccountBtn')?.addEventListener('click', () => disableBookingAccount(client.id));
       $('clientProfileModal').classList.remove('hidden');
     }
 
@@ -3322,6 +3339,119 @@
       showMessage($('clientMessage'), `Pricing settings saved. Mark up ${markupPercentDisplay(markup)}%, demurrage £${moneyRateDisplay(demurrageRate)} P/H, loading allowance ${hourAllowanceDisplay(loadingAllowance)} hour(s), tipping allowance ${hourAllowanceDisplay(tippingAllowance)} hour(s).`, 'success');
     }
 
+    async function saveClientPortalPassword(clientId) {
+      if (!state.supabase) {
+        showMessage($('clientMessage'), 'Connect to Supabase first.', 'error');
+        return;
+      }
+
+      const client = state.clients.find(c => c.id === clientId);
+      if (!client) return;
+      if (!client.auth_user_id && !client.portal_enabled) {
+        showMessage($('clientMessage'), 'Create a booking customer account before saving a portal password.', 'error');
+        return;
+      }
+
+      const password = String($('clientProfilePortalPassword')?.value || '').trim();
+      if (password.length < 8) {
+        showMessage($('clientMessage'), 'Temporary password must be at least 8 characters.', 'error');
+        return;
+      }
+
+      const saveBtn = $('saveClientPortalPasswordBtn');
+      saveBtn.disabled = true;
+      showMessage($('clientMessage'), 'Updating booking customer password...');
+
+      try {
+        const supabaseUrl = (localStorage.getItem('invoice_app_supabase_url') || DEFAULT_SUPABASE_URL).replace(/\/$/, '');
+        const anonKey = localStorage.getItem('invoice_app_supabase_anon_key') || DEFAULT_SUPABASE_ANON_KEY;
+        const { data: sessionData } = await state.supabase.auth.getSession();
+        const bearer = sessionData?.session?.access_token || '';
+        if (!bearer) throw new Error('Please login with your office account first.');
+
+        const response = await fetch(`${supabaseUrl}/functions/v1/update-booking-account-password`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'apikey': anonKey,
+            'Authorization': `Bearer ${bearer}`
+          },
+          body: JSON.stringify({
+            clientId,
+            password
+          })
+        });
+
+        const text = await response.text();
+        let data;
+        try { data = text ? JSON.parse(text) : {}; } catch { data = { error: text }; }
+        if (!response.ok) throw new Error(data?.error || data?.message || text || `HTTP ${response.status}`);
+
+        client.portal_temp_password = password;
+        await fetchClients(false);
+        openClientProfileModal(clientId);
+        showMessage($('clientMessage'), `Booking customer password updated for ${client.customer_name || 'this customer'}.`, 'success');
+      } catch (error) {
+        showMessage($('clientMessage'), error.message || 'Could not update the booking customer password.', 'error');
+      } finally {
+        saveBtn.disabled = false;
+      }
+    }
+
+    async function disableBookingAccount(clientId) {
+      if (!state.supabase) {
+        showMessage($('clientMessage'), 'Connect to Supabase first.', 'error');
+        return;
+      }
+
+      const client = state.clients.find(c => c.id === clientId);
+      if (!client) return;
+      if (!client.auth_user_id && !client.portal_enabled) {
+        showMessage($('clientMessage'), 'This client does not have an active booking customer account.', 'error');
+        return;
+      }
+
+      const customerName = client.customer_name || 'this customer';
+      if (!confirm(`Disable booking customer account for ${customerName}?\n\nThis will delete their customer portal login and remove the linked portal account record. The client profile, accounts email, traffic email, telephone and address will stay in the invoicing app.\n\nTo reactivate them later you will need to press Create booking account again.`)) {
+        return;
+      }
+
+      const disableBtn = $('disableBookingAccountBtn');
+      disableBtn.disabled = true;
+      showMessage($('clientMessage'), 'Disabling booking customer account...');
+
+      try {
+        const supabaseUrl = (localStorage.getItem('invoice_app_supabase_url') || DEFAULT_SUPABASE_URL).replace(/\/$/, '');
+        const anonKey = localStorage.getItem('invoice_app_supabase_anon_key') || DEFAULT_SUPABASE_ANON_KEY;
+        const { data: sessionData } = await state.supabase.auth.getSession();
+        const bearer = sessionData?.session?.access_token || '';
+        if (!bearer) throw new Error('Please login with your office account first.');
+
+        const response = await fetch(`${supabaseUrl}/functions/v1/disable-booking-account`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'apikey': anonKey,
+            'Authorization': `Bearer ${bearer}`
+          },
+          body: JSON.stringify({ clientId })
+        });
+
+        const text = await response.text();
+        let data;
+        try { data = text ? JSON.parse(text) : {}; } catch { data = { error: text }; }
+        if (!response.ok) throw new Error(data?.error || data?.message || text || `HTTP ${response.status}`);
+
+        await fetchClients(false);
+        closeClientProfileModal();
+        showMessage($('clientMessage'), `Booking customer account disabled for ${customerName}. The client profile has been kept.`, 'success');
+      } catch (error) {
+        showMessage($('clientMessage'), error.message || 'Could not disable the booking customer account.', 'error');
+      } finally {
+        if (disableBtn) disableBtn.disabled = false;
+      }
+    }
+
     async function saveClientProfileTrafficEmail(clientId) {
       if (!state.supabase) {
         showMessage($('clientMessage'), 'Connect to Supabase first.', 'error');
@@ -3366,7 +3496,7 @@
         const batch = clientIds.slice(i, i + 500);
         const { data, error } = await state.supabase
           .from('customer_portal_accounts')
-          .select('client_id, auth_user_id, email, portal_enabled, quote_markup_percent, demurrage_rate_per_hour, loading_time_allowance_hours, tipping_time_allowance_hours')
+          .select('client_id, auth_user_id, email, portal_enabled, portal_temp_password, quote_markup_percent, demurrage_rate_per_hour, loading_time_allowance_hours, tipping_time_allowance_hours')
           .in('client_id', batch);
 
         if (error) {
@@ -3423,6 +3553,7 @@
           _portalAccount: portal,
           auth_user_id: portal?.auth_user_id || client.auth_user_id,
           portal_enabled: portal?.portal_enabled ?? client.portal_enabled,
+          portal_temp_password: portal?.portal_temp_password ?? client.portal_temp_password,
           quote_markup_percent: portal?.quote_markup_percent ?? client.quote_markup_percent,
           demurrage_rate_per_hour: portal?.demurrage_rate_per_hour ?? client.demurrage_rate_per_hour,
           loading_time_allowance_hours: portal?.loading_time_allowance_hours ?? 1,
